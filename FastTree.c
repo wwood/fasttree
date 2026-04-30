@@ -1416,7 +1416,8 @@ double PGamma(double x, double alpha);
 /* Given a topology and branch lengths, optimize GTR rates and quickly reoptimize branch lengths
    If gtrfreq is NULL, then empirical frequencies are used
 */
-void SetMLGtr(/*IN/OUT*/NJ_t *NJ, /*OPTIONAL IN*/double *gtrfreq, /*OPTIONAL WRITE*/FILE *fpLog);
+void SetMLGtr(/*IN/OUT*/NJ_t *NJ, /*OPTIONAL IN*/double *gtrfreq, /*OPTIONAL WRITE*/FILE *fpLog,
+	      /*OPTIONAL OUT*/double *out_rates, /*OPTIONAL OUT*/double *out_freq);
 
 /* P(A & B | len) = P(B | A, len) * P(A)
    If site_likelihoods is present, multiplies those values by the site likelihood at each point
@@ -2265,6 +2266,8 @@ int main(int argc, char **argv) {
       int iMLlenRound = 0;
       int iMLlenMaxRound = 0;
       double dMLlenLastLogLk = -1e20;
+      double saved_gtr_rates_buf[6];
+      double saved_gtr_freq_buf[4];
       double *saved_gtr_rates = NULL;
       double *saved_gtr_freq = NULL;
       checkpoint_data_t *ckpt = NULL;
@@ -2278,6 +2281,12 @@ int main(int argc, char **argv) {
 	  if (NJ->transmat != NULL)
 	    NJ->transmat = myfree(NJ->transmat, sizeof(transition_matrix_t));
 	  NJ->transmat = CreateGTR(ckpt->gtr_rates, ckpt->gtr_freq);
+	  /* Save GTR rates for future checkpoint writes */
+	  int gi;
+	  for (gi = 0; gi < 6; gi++) saved_gtr_rates_buf[gi] = ckpt->gtr_rates[gi];
+	  for (gi = 0; gi < 4; gi++) saved_gtr_freq_buf[gi] = ckpt->gtr_freq[gi];
+	  saved_gtr_rates = saved_gtr_rates_buf;
+	  saved_gtr_freq = saved_gtr_freq_buf;
 	}
 
 	if (verbose)
@@ -2403,11 +2412,6 @@ int main(int argc, char **argv) {
 	    }
 	  }
 
-	  if (checkpointFile)
-	    WriteCheckpoint(checkpointFile, CKPT_AFTER_ME_NNI, NJ,
-			    i+1, nniToDo, sprRemaining, spr, MLnniToDo, bConvergedME, -1e20,
-			    0, bUseGtrFreq, gtrfreq, nRateCats, 0, 0, -1e20, nni_stats, NULL, NULL);
-
 	  /* Interleave SPRs with NNIs (typically 1/3rd NNI, SPR, 1/3rd NNI, SPR, 1/3rd NNI */
 	  if (sprRemaining > 0 && (nniToDo/(spr+1) > 0 && ((i+1) % (nniToDo/(spr+1))) == 0)) {
 	    SPR(/*IN/OUT*/NJ, maxSPRLength, spr-sprRemaining, spr);
@@ -2417,12 +2421,13 @@ int main(int argc, char **argv) {
 	    bConvergedME = false;
 	    nni_stats = FreeNNIStats(nni_stats, NJ);
 	    nni_stats = InitNNIStats(NJ);
-
-	    if (checkpointFile)
-	      WriteCheckpoint(checkpointFile, CKPT_AFTER_ME_SPR, NJ,
-			      i+1, nniToDo, sprRemaining, spr, MLnniToDo, 0, -1e20,
-			      0, bUseGtrFreq, gtrfreq, nRateCats, 0, 0, -1e20, nni_stats, NULL, NULL);
 	  }
+
+	  /* Checkpoint after NNI + any interleaved SPR for this iteration */
+	  if (checkpointFile)
+	    WriteCheckpoint(checkpointFile, CKPT_AFTER_ME_NNI, NJ,
+			    i+1, nniToDo, sprRemaining, spr, MLnniToDo, bConvergedME, -1e20,
+			    0, bUseGtrFreq, gtrfreq, nRateCats, 0, 0, -1e20, nni_stats, NULL, NULL);
 	}
 	nni_stats = FreeNNIStats(nni_stats, NJ);
       }
@@ -2565,8 +2570,12 @@ int main(int argc, char **argv) {
 			      iRound, maxRound, dLastLogLk, NULL, NULL, NULL);
 
 	    if (iRound == 1) {
-	      if (resetGtr)
-		SetMLGtr(/*IN/OUT*/NJ, bUseGtrFreq ? gtrfreq : NULL, fpLog);
+	      if (resetGtr) {
+		SetMLGtr(/*IN/OUT*/NJ, bUseGtrFreq ? gtrfreq : NULL, fpLog,
+			 saved_gtr_rates_buf, saved_gtr_freq_buf);
+		saved_gtr_rates = saved_gtr_rates_buf;
+		saved_gtr_freq = saved_gtr_freq_buf;
+	      }
 	      SetMLRates(/*IN/OUT*/NJ, nRateCats);
 	      LogMLRates(fpLog, NJ);
 
@@ -2575,8 +2584,7 @@ int main(int argc, char **argv) {
 				0, nniToDo, 0, spr, MLnniToDo, 0, -1e20,
 				0, bUseGtrFreq, gtrfreq, nRateCats,
 				iRound, maxRound, loglk, NULL,
-				resetGtr ? NJ->transmat->eigenval : NULL,
-				resetGtr ? NJ->transmat->stat : NULL);
+				saved_gtr_rates, saved_gtr_freq);
 	    }
 	    dLastLogLk = loglk;
 	    if (bConv)
@@ -2594,7 +2602,7 @@ int main(int argc, char **argv) {
 	      WriteCheckpoint(checkpointFile, CKPT_AFTER_ML_INIT_OPT, NJ,
 			      0, nniToDo, 0, spr, MLnniToDo, 0, -1e20,
 			      resetGtr ? 1 : 0, bUseGtrFreq, gtrfreq, nRateCats,
-			      0, 0, -1e20, NULL, NULL, NULL);
+			      0, 0, -1e20, NULL, saved_gtr_rates, saved_gtr_freq);
 	  }
 	}
 
@@ -2621,7 +2629,7 @@ int main(int argc, char **argv) {
 	    WriteCheckpoint(checkpointFile, CKPT_AFTER_ML_NNI, NJ,
 			    iMLnni+1, nniToDo, 0, spr, MLnniToDo, bConvergedML, loglk,
 			    resetGtr ? 1 : 0, bUseGtrFreq, gtrfreq, nRateCats,
-			    0, 0, -1e20, nni_stats, NULL, NULL);
+			    0, 0, -1e20, nni_stats, saved_gtr_rates, saved_gtr_freq);
 
 	  if (bConvergedML)
 	    break;		/* we did our extra round */
@@ -2640,8 +2648,12 @@ int main(int argc, char **argv) {
 	  }
 	  lastloglk = loglk;
 	  if (iMLnni == 0 && NJ->rates.nRateCategories == 1) {
-	    if (resetGtr)
-	      SetMLGtr(/*IN/OUT*/NJ, bUseGtrFreq ? gtrfreq : NULL, fpLog);
+	    if (resetGtr) {
+	      SetMLGtr(/*IN/OUT*/NJ, bUseGtrFreq ? gtrfreq : NULL, fpLog,
+		       saved_gtr_rates_buf, saved_gtr_freq_buf);
+	      saved_gtr_rates = saved_gtr_rates_buf;
+	      saved_gtr_freq = saved_gtr_freq_buf;
+	    }
 	    SetMLRates(/*IN/OUT*/NJ, nRateCats);
 	    LogMLRates(fpLog, NJ);
 
@@ -2649,7 +2661,7 @@ int main(int argc, char **argv) {
 	      WriteCheckpoint(checkpointFile, CKPT_AFTER_ML_NNI_SETRATES, NJ,
 			      iMLnni+1, nniToDo, 0, spr, MLnniToDo, bConvergedML, loglk,
 			      0, bUseGtrFreq, gtrfreq, nRateCats,
-			      0, 0, -1e20, nni_stats, NULL, NULL);
+			      0, 0, -1e20, nni_stats, saved_gtr_rates, saved_gtr_freq);
 	  }
 	}
 	nni_stats = FreeNNIStats(nni_stats, NJ);
@@ -2674,7 +2686,8 @@ int main(int argc, char **argv) {
 	  if (checkpointFile)
 	    WriteCheckpoint(checkpointFile, CKPT_AFTER_ML_FINAL_OPT, NJ,
 			    0, nniToDo, 0, spr, MLnniToDo, 0, -1e20,
-			    0, bUseGtrFreq, gtrfreq, nRateCats, 0, 0, -1e20, NULL, NULL, NULL);
+			    0, bUseGtrFreq, gtrfreq, nRateCats, 0, 0, -1e20, NULL,
+			    saved_gtr_rates, saved_gtr_freq);
 	}
 
       ckpt_after_ml_final_opt:
@@ -6513,7 +6526,8 @@ double TreeLogLk(/*IN*/NJ_t *NJ, /*OPTIONAL OUT*/double *site_loglk) {
   return(loglk);
 }
 
-void SetMLGtr(/*IN/OUT*/NJ_t *NJ, /*OPTIONAL IN*/double *freq_in, /*OPTIONAL WRITE*/FILE *fpLog) {
+void SetMLGtr(/*IN/OUT*/NJ_t *NJ, /*OPTIONAL IN*/double *freq_in, /*OPTIONAL WRITE*/FILE *fpLog,
+	      /*OPTIONAL OUT*/double *out_rates, /*OPTIONAL OUT*/double *out_freq) {
   int i;
   assert(nCodes==4);
   gtr_opt_t gtr;
@@ -6569,6 +6583,12 @@ void SetMLGtr(/*IN/OUT*/NJ_t *NJ, /*OPTIONAL IN*/double *freq_in, /*OPTIONAL WRI
     fprintf(fpLog, "GTRRates\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\n",
 	    gtr.rates[0],gtr.rates[1],gtr.rates[2],gtr.rates[3],gtr.rates[4],gtr.rates[5]);
   }
+  if (out_rates != NULL)
+    for (i = 0; i < 6; i++)
+      out_rates[i] = gtr.rates[i];
+  if (out_freq != NULL)
+    for (i = 0; i < 4; i++)
+      out_freq[i] = gtr.freq[i];
   myfree(NJ->transmat, sizeof(transition_matrix_t));
   NJ->transmat = CreateGTR(gtr.rates, gtr.freq);
   RecomputeMLProfiles(/*IN/OUT*/NJ);

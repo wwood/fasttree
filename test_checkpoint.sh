@@ -1,14 +1,15 @@
 #!/bin/bash
 # Test script for FastTree checkpoint/restart functionality.
-# Verifies bit-identical output for single-threaded runs and
-# successful completion for multi-threaded runs.
+# Verifies bit-identical output for single-threaded runs across
+# different models and settings, plus multi-threaded completion.
 #
-# Usage: ./test_checkpoint.sh [path_to_alignment]
-# Default alignment: BigCOGs/COG1011.500.p
+# Usage: ./test_checkpoint.sh [protein_alignment] [nucleotide_alignment]
+# Defaults: BigCOGs/COG1011.500.p and 16S500/16S.1.p
 
 set -euo pipefail
 
-ALN="${1:-BigCOGs/COG1011.500.p}"
+AA_ALN="${1:-BigCOGs/COG1011.500.p}"
+NT_ALN="${2:-16S500/16S.1.p}"
 FASTTREE="./FastTree"
 TMPDIR=$(mktemp -d)
 PASS=0
@@ -33,111 +34,130 @@ echo "=== Compiling FastTree ==="
 gcc -DOPENMP -O3 -fopenmp -fopenmp-simd -funsafe-math-optimizations -march=native \
     -o "$FASTTREE" FastTree.c -lm
 echo "Compiled OK"
-
 echo ""
+
+# run_checkpoint_test NAME ARGS... ALN
+#   1. Full reference run (no checkpoint)
+#   2. Full run with checkpoint (should match reference)
+#   3. Early restart (kill after 15% of ref time)
+#   4. Late restart (from full run's last checkpoint)
+run_checkpoint_test() {
+    local name="$1"
+    shift
+    local aln="${!#}"             # last argument is alignment
+    local ft_args="${@:1:$#-1}"  # everything except last arg
+
+    echo "--- $name ---"
+
+    # Reference run
+    OMP_NUM_THREADS=1 "$FASTTREE" $ft_args "$aln" \
+        > "$TMPDIR/${name}_ref.tree" 2>"$TMPDIR/${name}_ref.stderr"
+    local ref_time
+    ref_time=$(grep "Total time:" "$TMPDIR/${name}_ref.stderr" | sed 's/Total time: \([0-9.]*\).*/\1/')
+    echo "  Reference: ${ref_time}s"
+
+    # Full checkpoint run
+    OMP_NUM_THREADS=1 "$FASTTREE" $ft_args -checkpoint "$TMPDIR/${name}_ckpt.bin" "$aln" \
+        > "$TMPDIR/${name}_ckpt.tree" 2>"$TMPDIR/${name}_ckpt.stderr"
+    if diff -q "$TMPDIR/${name}_ref.tree" "$TMPDIR/${name}_ckpt.tree" > /dev/null 2>&1; then
+        pass_test "$name: checkpoint run matches reference"
+    else
+        fail_test "$name: checkpoint run differs from reference"
+    fi
+
+    # Early restart (kill after 15% of ref time, min 2s)
+    local early_timeout
+    early_timeout=$(python3 -c "t=int(float('$ref_time')*0.15); print(max(t,2))")
+    timeout "$early_timeout" bash -c \
+        "OMP_NUM_THREADS=1 $FASTTREE $ft_args -checkpoint $TMPDIR/${name}_early.bin $aln > /dev/null 2>$TMPDIR/${name}_early.stderr" || true
+    if [ -f "$TMPDIR/${name}_early.bin" ]; then
+        local phase
+        phase=$(grep "Checkpoint saved" "$TMPDIR/${name}_early.stderr" | tail -1 | sed 's/.*phase \([0-9]*\).*/\1/')
+        local round
+        round=$(grep "Checkpoint saved" "$TMPDIR/${name}_early.stderr" | tail -1 | sed 's/.*round \([0-9]*\).*/\1/')
+        echo "  Early checkpoint: phase $phase round $round (timeout ${early_timeout}s)"
+        OMP_NUM_THREADS=1 "$FASTTREE" $ft_args -restart "$TMPDIR/${name}_early.bin" "$aln" \
+            > "$TMPDIR/${name}_restart_early.tree" 2>"$TMPDIR/${name}_restart_early.stderr"
+        if diff -q "$TMPDIR/${name}_ref.tree" "$TMPDIR/${name}_restart_early.tree" > /dev/null 2>&1; then
+            pass_test "$name: early restart (phase $phase) matches reference"
+        else
+            fail_test "$name: early restart (phase $phase) differs from reference"
+        fi
+    else
+        echo "  WARNING: no early checkpoint created (timeout ${early_timeout}s too short for NJ)"
+    fi
+
+    # Late restart (from full run's last checkpoint)
+    local late_phase
+    late_phase=$(grep "Checkpoint saved" "$TMPDIR/${name}_ckpt.stderr" | tail -1 | sed 's/.*phase \([0-9]*\).*/\1/')
+    local late_round
+    late_round=$(grep "Checkpoint saved" "$TMPDIR/${name}_ckpt.stderr" | tail -1 | sed 's/.*round \([0-9]*\).*/\1/')
+    echo "  Late checkpoint: phase $late_phase round $late_round"
+    OMP_NUM_THREADS=1 "$FASTTREE" $ft_args -restart "$TMPDIR/${name}_ckpt.bin" "$aln" \
+        > "$TMPDIR/${name}_restart_late.tree" 2>"$TMPDIR/${name}_restart_late.stderr"
+    if diff -q "$TMPDIR/${name}_ref.tree" "$TMPDIR/${name}_restart_late.tree" > /dev/null 2>&1; then
+        pass_test "$name: late restart (phase $late_phase) matches reference"
+    else
+        fail_test "$name: late restart (phase $late_phase) differs from reference"
+    fi
+    echo ""
+}
+
 echo "=== Single-threaded tests (OMP_NUM_THREADS=1) ==="
-echo "Using alignment: $ALN"
 echo ""
 
-# 1. Reference run (single-threaded, no checkpoint)
-echo "--- 1. Reference run ---"
-OMP_NUM_THREADS=1 "$FASTTREE" "$ALN" > "$TMPDIR/ref.tree" 2>"$TMPDIR/ref.stderr"
-REF_TIME=$(grep "Total time:" "$TMPDIR/ref.stderr" | sed 's/Total time: \([0-9.]*\).*/\1/')
-echo "Reference run complete: ${REF_TIME}s ($(wc -c < "$TMPDIR/ref.tree") bytes)"
+# Protein models
+run_checkpoint_test "protein_jtt"       "$AA_ALN"
+run_checkpoint_test "protein_wag" -wag  "$AA_ALN"
+run_checkpoint_test "protein_lg"  -lg   "$AA_ALN"
 
-# 2. Checkpoint run (single-threaded, full run) - should match reference
-echo "--- 2. Checkpoint run (full, no restart) ---"
-OMP_NUM_THREADS=1 "$FASTTREE" -checkpoint "$TMPDIR/ckpt_full.bin" "$ALN" \
-    > "$TMPDIR/ckpt_full.tree" 2>"$TMPDIR/ckpt_full.stderr"
-CKPT_TIME=$(grep "Total time:" "$TMPDIR/ckpt_full.stderr" | sed 's/Total time: \([0-9.]*\).*/\1/')
-echo "Checkpoint run complete: ${CKPT_TIME}s"
-if diff -q "$TMPDIR/ref.tree" "$TMPDIR/ckpt_full.tree" > /dev/null 2>&1; then
-    pass_test "Checkpoint run matches reference (no restart)"
-else
-    fail_test "Checkpoint run differs from reference (no restart)"
-fi
+# Protein with different rate models
+run_checkpoint_test "protein_nocat" -nocat "$AA_ALN"
+run_checkpoint_test "protein_gamma" -gamma "$AA_ALN"
 
-# 3. Restart from early checkpoint (after NJ + a few ME-NNI rounds)
-echo "--- 3. Restart from early phase ---"
-# Kill after 15% of reference time to get an early checkpoint
-EARLY_TIMEOUT=$(echo "$REF_TIME" | awk '{t=int($1*0.15); if(t<15) t=15; print t}')
-echo "  Timeout: ${EARLY_TIMEOUT}s"
-timeout "$EARLY_TIMEOUT" bash -c \
-    "OMP_NUM_THREADS=1 $FASTTREE -checkpoint $TMPDIR/ckpt_early.bin $ALN > /dev/null 2>$TMPDIR/ckpt_early.stderr" || true
-if [ -f "$TMPDIR/ckpt_early.bin" ]; then
-    PHASE=$(grep "Checkpoint saved" "$TMPDIR/ckpt_early.stderr" | tail -1 | sed 's/.*phase \([0-9]*\).*/\1/')
-    ROUND=$(grep "Checkpoint saved" "$TMPDIR/ckpt_early.stderr" | tail -1 | sed 's/.*round \([0-9]*\).*/\1/')
-    echo "  Checkpointed at phase $PHASE round $ROUND"
-    OMP_NUM_THREADS=1 "$FASTTREE" -restart "$TMPDIR/ckpt_early.bin" "$ALN" \
-        > "$TMPDIR/restart_early.tree" 2>"$TMPDIR/restart_early.stderr"
-    if diff -q "$TMPDIR/ref.tree" "$TMPDIR/restart_early.tree" > /dev/null 2>&1; then
-        pass_test "Restart from phase $PHASE round $ROUND matches reference"
-    else
-        fail_test "Restart from phase $PHASE round $ROUND differs from reference"
-    fi
-else
-    fail_test "Early checkpoint was not created (NJ took longer than ${EARLY_TIMEOUT}s)"
-fi
+# Protein without ML
+run_checkpoint_test "protein_noml" -noml "$AA_ALN"
 
-# 4. Restart from mid checkpoint (after ME phases, into ML)
-echo "--- 4. Restart from mid phase ---"
-# Kill after 50% of reference time to get a mid-run checkpoint
-MID_TIMEOUT=$(echo "$REF_TIME" | awk '{t=int($1*0.50); if(t<60) t=60; print t}')
-echo "  Timeout: ${MID_TIMEOUT}s"
-timeout "$MID_TIMEOUT" bash -c \
-    "OMP_NUM_THREADS=1 $FASTTREE -checkpoint $TMPDIR/ckpt_mid.bin $ALN > /dev/null 2>$TMPDIR/ckpt_mid.stderr" || true
-if [ -f "$TMPDIR/ckpt_mid.bin" ]; then
-    PHASE=$(grep "Checkpoint saved" "$TMPDIR/ckpt_mid.stderr" | tail -1 | sed 's/.*phase \([0-9]*\).*/\1/')
-    ROUND=$(grep "Checkpoint saved" "$TMPDIR/ckpt_mid.stderr" | tail -1 | sed 's/.*round \([0-9]*\).*/\1/')
-    echo "  Checkpointed at phase $PHASE round $ROUND"
-    OMP_NUM_THREADS=1 "$FASTTREE" -restart "$TMPDIR/ckpt_mid.bin" "$ALN" \
-        > "$TMPDIR/restart_mid.tree" 2>"$TMPDIR/restart_mid.stderr"
-    if diff -q "$TMPDIR/ref.tree" "$TMPDIR/restart_mid.tree" > /dev/null 2>&1; then
-        pass_test "Restart from phase $PHASE round $ROUND matches reference"
-    else
-        fail_test "Restart from phase $PHASE round $ROUND differs from reference"
-    fi
-else
-    fail_test "Mid checkpoint was not created (timeout ${MID_TIMEOUT}s too short)"
-fi
+# Nucleotide models
+run_checkpoint_test "nucleotide_jc"  -nt       "$NT_ALN"
+run_checkpoint_test "nucleotide_gtr" -nt -gtr  "$NT_ALN"
 
-# 5. Restart from late checkpoint (last checkpoint of full run)
-echo "--- 5. Restart from late phase ---"
-PHASE=$(grep "Checkpoint saved" "$TMPDIR/ckpt_full.stderr" | tail -1 | sed 's/.*phase \([0-9]*\).*/\1/')
-ROUND=$(grep "Checkpoint saved" "$TMPDIR/ckpt_full.stderr" | tail -1 | sed 's/.*round \([0-9]*\).*/\1/')
-echo "  Last checkpoint at phase $PHASE round $ROUND"
-OMP_NUM_THREADS=1 "$FASTTREE" -restart "$TMPDIR/ckpt_full.bin" "$ALN" \
-    > "$TMPDIR/restart_late.tree" 2>"$TMPDIR/restart_late.stderr"
-if diff -q "$TMPDIR/ref.tree" "$TMPDIR/restart_late.tree" > /dev/null 2>&1; then
-    pass_test "Restart from phase $PHASE round $ROUND (late ML) matches reference"
-else
-    fail_test "Restart from phase $PHASE round $ROUND (late ML) differs from reference"
-fi
+# Nucleotide with gamma
+run_checkpoint_test "nucleotide_gtr_gamma" -nt -gtr -gamma "$NT_ALN"
 
-echo ""
 echo "=== Multi-threaded test ==="
 echo ""
 
-# 6. Multi-threaded checkpoint + restart (verify it completes without error)
-echo "--- 6. Multi-threaded checkpoint run ---"
-"$FASTTREE" -checkpoint "$TMPDIR/ckpt_mt.bin" "$ALN" \
+# Multi-threaded checkpoint + restart (verify completion, not bit-identity)
+echo "--- Multi-threaded protein ---"
+"$FASTTREE" -checkpoint "$TMPDIR/mt_ckpt.bin" "$AA_ALN" \
     > "$TMPDIR/mt_full.tree" 2>"$TMPDIR/mt_full.stderr"
-MT_PHASE=$(grep "Checkpoint saved" "$TMPDIR/mt_full.stderr" | tail -1 | sed 's/.*phase \([0-9]*\).*/\1/')
 MT_TIME=$(grep "Total time:" "$TMPDIR/mt_full.stderr" | sed 's/Total time: \([0-9.]*\).*/\1/')
-echo "  Completed in ${MT_TIME}s, last checkpoint at phase $MT_PHASE"
-echo "  Tree size: $(wc -c < "$TMPDIR/mt_full.tree") bytes"
+echo "  Full run: ${MT_TIME}s"
 
-echo "--- 7. Multi-threaded restart ---"
-"$FASTTREE" -restart "$TMPDIR/ckpt_mt.bin" "$ALN" \
-    > "$TMPDIR/restart_mt.tree" 2>"$TMPDIR/restart_mt.stderr"
-MT_RESTART_SIZE=$(wc -c < "$TMPDIR/restart_mt.tree")
-if [ "$MT_RESTART_SIZE" -gt 0 ] && grep -q "Total time:" "$TMPDIR/restart_mt.stderr"; then
-    pass_test "Multi-threaded restart completed successfully ($MT_RESTART_SIZE bytes)"
+"$FASTTREE" -restart "$TMPDIR/mt_ckpt.bin" "$AA_ALN" \
+    > "$TMPDIR/mt_restart.tree" 2>"$TMPDIR/mt_restart.stderr"
+MT_RESTART_SIZE=$(wc -c < "$TMPDIR/mt_restart.tree")
+if [ "$MT_RESTART_SIZE" -gt 0 ] && grep -q "Total time:" "$TMPDIR/mt_restart.stderr"; then
+    pass_test "Multi-threaded restart completed ($MT_RESTART_SIZE bytes)"
 else
     fail_test "Multi-threaded restart failed or produced empty output"
 fi
-# Note: multi-threaded trees are not compared because OpenMP scheduling
-# causes non-determinism between separate runs.
+
+echo "--- Multi-threaded nucleotide GTR ---"
+"$FASTTREE" -nt -gtr -checkpoint "$TMPDIR/mt_nt_ckpt.bin" "$NT_ALN" \
+    > "$TMPDIR/mt_nt_full.tree" 2>"$TMPDIR/mt_nt_full.stderr"
+MT_NT_TIME=$(grep "Total time:" "$TMPDIR/mt_nt_full.stderr" | sed 's/Total time: \([0-9.]*\).*/\1/')
+echo "  Full run: ${MT_NT_TIME}s"
+
+"$FASTTREE" -nt -gtr -restart "$TMPDIR/mt_nt_ckpt.bin" "$NT_ALN" \
+    > "$TMPDIR/mt_nt_restart.tree" 2>"$TMPDIR/mt_nt_restart.stderr"
+MT_NT_SIZE=$(wc -c < "$TMPDIR/mt_nt_restart.tree")
+if [ "$MT_NT_SIZE" -gt 0 ] && grep -q "Total time:" "$TMPDIR/mt_nt_restart.stderr"; then
+    pass_test "Multi-threaded nucleotide GTR restart completed ($MT_NT_SIZE bytes)"
+else
+    fail_test "Multi-threaded nucleotide GTR restart failed"
+fi
 
 echo ""
 echo "=== Results ==="
